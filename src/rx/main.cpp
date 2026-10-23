@@ -3,7 +3,8 @@
  * FIRMWARE RECEIVER (RX) - RC UNIVERSAL HYBRID (ESC & MOSFET)
  * ============================================================================
  * Fitur: Auto-Binding, No-Pulses Failsafe (Motor Beep), Slew-Rate Limiter, 
- *        Throttle Deadband Lock, 4 Mode Terbang, dan Penggerak Motor Hybrid.
+ *        Throttle Deadband Lock, 4 Mode Terbang, Penggerak Motor Hybrid,
+ *        dan AUTO-CELL DETECT (Deteksi Baterai 1S/2S/3S Otomatis).
  * ============================================================================
  */
 
@@ -30,7 +31,7 @@ const byte BIND_ADDR[6] = "BIND0"; // Alamat Pipa Darurat untuk proses Binding
 const uint8_t BIND_CH   = 10;      // Channel Darurat untuk proses Binding
 
 // ============================================================================
-// 2. STRUKTUR DATA (WAJIB SAMA PERSIS DENGAN TX)
+// 2. STRUKTUR DATA (SUDAH DISAMAKAN DENGAN TX V930 BARU)
 // ============================================================================
 // Paket Data untuk Binding
 struct BindPayload {
@@ -51,10 +52,10 @@ struct ControlData {
 };
 ControlData rxData;
 
-// Paket Data Telemetri (Dikirim balik ke TX)
+// Paket Data Telemetri (Struktur BARU: Mengirim Status, bukan Voltase Mentah)
 struct TelemetryData {
-  uint16_t batteryMilliVolt; // Tegangan baterai pesawat
-  uint8_t  failsafeActive;   // Melapor ke TX jika RX sedang mode darurat
+  uint8_t batteryStatus;  // 0 = Normal, 1 = Low Batt, 2 = Critical
+  uint8_t failsafeActive; // Melapor ke TX jika RX sedang mode darurat (0 = Aman, 1 = Failsafe)
 };
 TelemetryData txTelem;
 
@@ -76,6 +77,10 @@ unsigned long lastRecvTime = 0; // Catatan waktu data terakhir masuk
 bool failsafeActive = true;     // Status hilang sinyal (default true saat baru nyala)
 bool escsAttached = false;      // Memantau apakah pin motor sedang dikuasai library Servo
 int currentThrottle = 0;        // Memori gas saat ini (untuk fitur Slew-Rate Limiter)
+
+// Variabel Khusus Auto-Cell Detect (Baterai Pintar)
+uint16_t lowBatteryThreshold = 0; // Menyimpan batas millivolt untuk memicu alarm
+uint8_t detectedCells = 0;        // Menyimpan status jenis baterai (1S, 2S, atau 3S)
 
 // ============================================================================
 // 4. FUNGSI BINDING (MENERIMA IDENTITAS DARI TX)
@@ -135,24 +140,48 @@ void setup() {
   radio.enableDynamicPayloads();
   radio.enableAckPayload(); // Aktifkan balasan telemetri
 
-  // --- CEK MEMORI BINDING ---
-  // Jika di EEPROM sudah ada tanda 0xBB, berarti pernah di-bind
-  if (EEPROM.read(0) == 0xBB) {
+  // --- CEK MEMORI BINDING & JUMPER D2 ---
+  pinMode(2, INPUT_PULLUP); // Siapkan Pin D2 untuk deteksi jumper
+
+  // Jika EEPROM perawan (kosong) ATAU Pin D2 dijumper ke GND, paksa Binding!
+  if (EEPROM.read(0) != 0xBB || digitalRead(2) == LOW) {
+    enterBindingMode();
+  } 
+  // Jika tidak di-jumper dan EEPROM sudah ada isinya, pakai memori lama
+  else {
     myChannel = EEPROM.read(1);
     for(int i=0; i<5; i++) myPipe[i] = EEPROM.read(2+i);
     isBound = true;
     Serial.println(F("[SYSTEM] Load Data Binding dari EEPROM."));
-  } else {
-    // Jika masih perawan/kosong, paksa masuk mode binding
-    enterBindingMode();
   }
 
-  // Aktifkan Radio sesuai data dari EEPROM
+  // --- KECERDASAN AUTO-CELL DETECT (Deteksi Voltase Otomatis) ---
+  uint16_t initialMilliVolt = map(analogRead(PIN_VBATT), 0, 1023, 0, 12600);
+  
+  if (initialMilliVolt < 4350) {
+    detectedCells = 1;
+    lowBatteryThreshold = 3500; // Batas alarm 3.5V
+  } else if (initialMilliVolt < 8500) {
+    detectedCells = 2;
+    lowBatteryThreshold = 7000; // Batas alarm 7.0V
+  } else {
+    detectedCells = 3;
+    lowBatteryThreshold = 10500; // Batas alarm 10.5V
+  }
+
+  Serial.print(F("[BATT DETECT] Lipo "));
+  Serial.print(detectedCells);
+  Serial.print(F("S Terdeteksi. Set Alarm: "));
+  Serial.println(lowBatteryThreshold);
+
+  // Aktifkan Radio
   radio.setChannel(myChannel);
   radio.openReadingPipe(1, myPipe);
   radio.startListening();
   
-  // Titipkan data telemetri pertama
+  // Titipkan data telemetri pertama (Aman secara default)
+  txTelem.batteryStatus = 0;
+  txTelem.failsafeActive = 1;
   radio.writeAckPayload(1, &txTelem, sizeof(TelemetryData));
   
   // Aktifkan Servo Sayap
@@ -180,10 +209,18 @@ void loop() {
       Serial.println(F("[RADIO] Link Tersambung Kembali. Motor Terkunci Otomatis."));
     }
     
-    // Update data Telemetri Baterai untuk membalas TX di loop berikutnya
-    txTelem.batteryMilliVolt = map(analogRead(PIN_VBATT), 0, 1023, 0, 12600); // Asumsi maks 3S Lipo (12.6V)
-    txTelem.failsafeActive = 0;
-    radio.writeAckPayload(1, &txTelem, sizeof(TelemetryData));
+    // --- EVALUASI BATERAI SECARA REAL-TIME ---
+    uint16_t currentMilliVolt = map(analogRead(PIN_VBATT), 0, 1023, 0, 12600);
+    
+    // Jika voltase turun di bawah batas aman sel yang terdeteksi
+    if (currentMilliVolt <= lowBatteryThreshold) {
+      txTelem.batteryStatus = 1; // Kirim sinyal bahaya ke TX (Low Batt!)
+    } else {
+      txTelem.batteryStatus = 0; // Baterai aman
+    }
+
+    txTelem.failsafeActive = 0; // Lapor TX bahwa RX sehat
+    radio.writeAckPayload(1, &txTelem, sizeof(TelemetryData)); // Titipkan data untuk diambil TX nanti
   }
 
   // --- B. LOGIKA FAILSAFE (TIDAK ADA DATA MASUK > 1 DETIK) ---
@@ -204,7 +241,7 @@ void loop() {
       // Netralkan posisi permukaan sayap agar pesawat meluncur lurus (Gliding)
       servo3.write(90); servo4.write(90);
     }
-    txTelem.failsafeActive = 1;
+    txTelem.failsafeActive = 1; // Update status telemetri gagal
 
     // LOST MODEL FINDER: Alarm pencarian jika hilang > 15 detik
     if (currentMillis - lastRecvTime > 15000) {
@@ -320,4 +357,3 @@ void loop() {
     digitalWrite(PIN_LED, rxData.isArmed ? HIGH : LOW);
   }
 }
-// =================================== AKHIR KODE ===================================
