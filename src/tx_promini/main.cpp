@@ -388,9 +388,9 @@ void setup() {
   }
 
   // Konfigurasi parameter komunikasi radio NRF24L01
-  radio.setPALevel(RF24_PA_HIGH); // Kembalikan ke HIGH seperti firmware lama
-  radio.setDataRate(RF24_1MBPS);  
-  radio.setRetries(3, 5);         // Batasi waktu tunggu ulang (maks ~4ms) agar tidak macet
+  radio.setPALevel(RF24_PA_HIGH); // HIGH agar pancaran radio kuat
+  radio.setDataRate(RF24_1MBPS); // 250kbps = Jarak jauh & stabil, 1Mbps = Jarak pendek & cepat
+  radio.setRetries(1, 3); // Jeda 500us, dicoba 3x. Total hanya 1.5ms (Aman dari macet & ACK tertangkap!)
   radio.enableDynamicPayloads();  
   radio.enableAckPayload();       
 
@@ -651,24 +651,28 @@ void loop() {
     txData.aileron  = (int8_t)ailFinal;
 
     // ------------------------------------------------------------------------
-    // G. PENGIRIMAN RADIO ASYNCHRONOUS (TRIK A: ANTI FREEZE)
+    // G. PENGIRIMAN RADIO SINKRONUS (STABIL & PASTI MENANGKAP ACK)
     // ------------------------------------------------------------------------
-    bool tx_ok, tx_fail, rx_ready;
-    radio.whatHappened(tx_ok, tx_fail, rx_ready); // 1. Paksa bersihkan flag NRF yang nyangkut
-    radio.flush_tx(); // 2. Buang sisa antrean paket macet di memori NRF
-    
-    // 3. Lempar data kendali ke udara seketika tanpa menunggu balasan (Non-Blocking)
-    radio.writeFast(&txData, sizeof(ControlData)); 
-
-    // 4. Intip apakah ada titipan data baterai dari RX (Sabar & Pasif)
-    if (radio.isAckPayloadAvailable()) {
-      radio.read(&rxTelem, sizeof(TelemetryData)); 
-      lastAckTime = currentMillis; 
+    if (radio.write(&txData, sizeof(ControlData))) {
+      // Sinyal sukses menembus antena RX, segera intip apakah RX menitipkan data baterai
+      if (radio.isAckPayloadAvailable()) {
+        radio.read(&rxTelem, sizeof(TelemetryData)); 
+        lastAckTime = currentMillis; 
+      }
+    } else {
+      // Sinyal tidak mendapat balasan (jarak asimetris/terhalang pohon), buang memori macet!
+      radio.flush_tx(); 
     }
 
+    // Kalkulasi koneksi LCD (Toleransi ikon hilang jika putus maksimal 1 detik)
     bool isRxConnected = (currentMillis - lastAckTime < 1000);
+    
+    // Jika lebih dari 1 detik tidak ada balasan, lupakan status baterai klien!
+    if (!isRxConnected) {
+      rxTelem.batteryStatus = 0; // Paksa nol agar alarm RX di TX langsung bungkam
+    }
 
-  // ========================================================================
+    // ========================================================================
     // --- LOGIKA BACA BATERAI TX (DENGAN DUMMY READ ANTI-CROSSTALK) ---
     // ========================================================================
     analogRead(PIN_BAT_TX); // DUMMY READ: Buang sisa tegangan dari pin A4 (Trim)

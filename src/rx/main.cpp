@@ -31,7 +31,7 @@ const byte BIND_ADDR[6] = "BIND0"; // Alamat Pipa Darurat untuk proses Binding
 const uint8_t BIND_CH   = 10;      // Channel Darurat untuk proses Binding
 
 // ============================================================================
-// 2. STRUKTUR DATA (SUDAH DISAMAKAN DENGAN TX V930 BARU)
+// 2. STRUKTUR DATA 
 // ============================================================================
 // Paket Data untuk Binding
 struct BindPayload {
@@ -173,6 +173,10 @@ void setup() {
   Serial.print(detectedCells);
   Serial.print(F("S Terdeteksi. Set Alarm: "));
   Serial.println(lowBatteryThreshold);
+
+  // MATIKAN TELINGA SEBELUM PINDAH FREKUENSI
+  radio.stopListening(); 
+  delay(10);             
 
   // Aktifkan Radio
   radio.setChannel(myChannel);
