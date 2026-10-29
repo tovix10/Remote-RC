@@ -2,7 +2,6 @@
  * ============================================================================
  * LIBRARY KHUSUS LCD H-8805A - UNTUK TX V930
  * ============================================================================
- * Pisahkan file ini di folder yang sama dengan firmware utama (.ino / main.cpp)
  */
 
 #ifndef LCD_H8805A_H
@@ -11,7 +10,7 @@
 #include <Arduino.h>
 
 // ============================================================================
-// PIN LCD (DIUBAH AGAR TIDAK BENTROK DENGAN NRF24L01 DI PIN 10, 11, 12)
+// PIN LCD 
 // ============================================================================
 #define LCD_CS_PIN   6
 #define LCD_WR_PIN   7

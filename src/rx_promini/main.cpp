@@ -224,6 +224,7 @@ void loop() {
     }
 
     txTelem.failsafeActive = 0; // Lapor TX bahwa RX sehat
+    radio.flush_tx();
     radio.writeAckPayload(1, &txTelem, sizeof(TelemetryData)); // Titipkan data untuk diambil TX nanti
   }
 
@@ -232,6 +233,8 @@ void loop() {
     if (!failsafeActive) {
       Serial.println(F("[FAILSAFE] Sinyal Hilang! Memicu No-Pulses Failsafe."));
       failsafeActive = true;
+      radio.flush_tx();
+      radio.flush_tx();
       rxData.isArmed = 0; // Kunci motor
       rxData.throttle = 0; // Matikan gas
       

@@ -96,8 +96,8 @@ unsigned long lastAckTime = 0;  // Mencatat waktu terakhir menerima balasan tele
 
 // Variabel keamanan motor dan penghalus pergerakan tuas gas
 bool isArmed           = false; // Status mesin (Default awal wajib false / terkunci)
-float smoothedThr      = 0;     // Nilai hasil filter penghalus EMA pada tuas gas
-const float EMA_ALPHA  = 0.15;  // Koefisien kelembutan filter EMA (0.15 = responsif & halus)
+// float smoothedThr      = 0;     // Nilai hasil filter penghalus EMA pada tuas gas
+// const float EMA_ALPHA  = 0.15;  // Koefisien kelembutan filter EMA (0.15 = responsif & halus)
 
 // Variabel manajemen Buzzer & LED Non-Blocking (Tanpa menghentikan laju program)
 unsigned long buzzerEndTime = 0;     // Waktu target kapan buzzer harus berhenti berbunyi
@@ -289,9 +289,9 @@ void loadModel(uint8_t slot) {
 // ============================================================================
 void executeBindingProcess() {
   Serial.println(F("[BIND] Memulai Proses Pancaran Binding 10 Detik..."));
-  radio.setChannel(BIND_CH);         // Pindah ke frekuensi channel khusus binding (Ch 10)
-  radio.openWritingPipe(BIND_ADDR);  // Buka pipa tujuan khusus binding ("BIND0")
-  radio.stopListening();             // Set modul NRF24 menjadi mode pemancar murni
+  radio.stopListening();             // 1. WAJIB DIATAS! Ubah jadi pemancar.
+  radio.setChannel(BIND_CH);         // 2. Set frekuensi
+  radio.openWritingPipe(BIND_ADDR);  // 3. Masukkan alamat "BIND0"
 
   // Siapkan isi paket identitas yang akan dikirim ke RX
   BindPayload bp;
@@ -326,19 +326,17 @@ void executeBindingProcess() {
 // ============================================================================
 // 7. FUNGSI KONVERSI & KALIBRASI STIK ANALOG (-127 S/D 127)
 // ============================================================================
-int mapJoystick(int val, int lower, int middle, int upper, int trimValue) {
-  val = constrain(val, lower, upper); // Batasi nilai mentah agar tidak keluar dari rentang kalibrasi
-  int output = 0;                     // Nilai default tengah adalah 0 (Diam)
+int mapJoystick(int val, int lower, int middle, int upper) { 
+  val = constrain(val, lower, upper);
+  int output = 0;
 
-  // Berikan area netral (Deadzone +/- 15 poin) di tengah agar servo tidak bergetar sendiri
   if (val < middle - 15) {
-    output = map(val, lower, middle - 15, -127, 0); // Petakan paruh bawah/kiri ke -127 s/d 0
+    output = map(val, lower, middle - 15, -127, 0);
   } else if (val > middle + 15) {
-    output = map(val, middle + 15, upper, 0, 127);  // Petakan paruh atas/kanan ke 0 s/d 127
+    output = map(val, middle + 15, upper, 0, 127);
   }
 
-  // Tambahkan nilai geseran Trim dan jaga agar tidak melampaui batas -127 s/d 127
-  return constrain(output + trimValue, -127, 127);
+  return output; // Hanya mengembalikan nilai stik murni
 }
 
 // ============================================================================
@@ -625,27 +623,32 @@ void loop() {
     }
 
     // ------------------------------------------------------------------------
-    // F. KALKULASI FILTER STIK & PENYUSUNAN PAKET DATA KENDALI
+    // F. KALKULASI STIK MURNI & PENYUSUNAN PAKET FINAL
     // ------------------------------------------------------------------------
-    // 1. Olah Stik Throttle dengan Deadzone bawah dan penghalus EMA Filter
-    if (rawThr < 20) rawThr = 15; // Kunci nilai bawah agar benar-benar rapat di nol
-    int constrainedThr = constrain(rawThr, 15, 680); // Rentang efektif potensio gas V930
-    smoothedThr = (EMA_ALPHA * constrainedThr) + ((1.0 - EMA_ALPHA) * smoothedThr);
-    int thrFinal = map((long)smoothedThr, 20, 680, 0, 255) + throttleTrim;
-    if (rawThr <= 25) thrFinal = 0; // Paksa mutlak 0 jika stik gas ditarik mentok ke bawah
+    // 1. Olah Stik Throttle (Respons Instan & Presisi)
+    int thrMurni = map(rawThr, 15, 680, 0, 255); // Langsung petakan nilai mentah
+    if (rawThr <= 20) thrMurni = 0;              // Ambang batas bawah diturunkan
+    thrMurni = constrain(thrMurni, 0, 255);      // Pastikan nilai murni terkunci aman 0-255
+    
+    int thrFinal = constrain(thrMurni + throttleTrim, 0, 255); // Nilai untuk NRF
+    
+    // 2. Olah Stik Rudder, Elevator, dan Aileron (Nilai MURNI untuk LCD)
+    int rudMurni = mapJoystick(rawRud, 11, 504, 1000);
+    int eleMurni = mapJoystick(rawEle, 8,  515, 1000);
+    int ailMurni = mapJoystick(rawAil, 10, 513, 1012);
 
-    // 2. Olah Stik Rudder, Elevator, dan Aileron beserta nilai Trim masing-masing
-    int rudFinal = mapJoystick(rawRud, 11, 504, 1000, rudderTrim);
-    int eleFinal = mapJoystick(rawEle, 8,  515, 1000, elevatorTrim);
-    int ailFinal = mapJoystick(rawAil, 10, 513, 1012, aileronTrim);
+    // 3. Kalkulasi Nilai FINAL (Stik Murni + Trim) untuk Pesawat
+    int rudFinal = constrain(rudMurni - rudderTrim, -127, 127);
+    int eleFinal = constrain(eleMurni + elevatorTrim, -127, 127);
+    int ailFinal = constrain(ailMurni - aileronTrim, -127, 127);
 
-    // 3. Masukkan status sistem ke dalam struktur paket yang akan dikirim
+    // 4. Masukkan status sistem & nilai FINAL ke paket data TX (Untuk RX)
     txData.isArmed   = isArmed ? 1 : 0;
     txData.auxFlag   = activeMode;
     txData.motorType = activeMotorType;
 
-    // 4. Masukkan nilai kemudi ke paket data (Jika Disarmed, tetap izinkan tes gerak servo di darat!)
-    txData.throttle = isArmed ? (uint8_t)constrain(thrFinal, 0, 255) : 0; // Gas wajib 0 jika Disarm
+    // WAJIB: Pesawat menerima rxData yang sudah FINAL (sudah ditambah trim)
+    txData.throttle = isArmed ? (uint8_t)constrain(thrFinal, 0, 255) : 0; 
     txData.rudder   = (int8_t)rudFinal;
     txData.elevator = (int8_t)eleFinal;
     txData.aileron  = (int8_t)ailFinal;
@@ -709,10 +712,10 @@ void loop() {
     bool isCharging = (analogRead(PIN_CHRG) < 500);
 
     // Panggil updateLCD dan masukkan txBatLevel ke dalamnya
-    updateLCD(isArmed, thrFinal, txBatLevel, isRxConnected, 
+    updateLCD(isArmed, thrMurni, txBatLevel, isRxConnected, 
               activeMode, activeMotorType, 
               throttleTrim, rudderTrim, elevatorTrim, aileronTrim, 
-              rudFinal, eleFinal, ailFinal, isCharging);
+              rudMurni, eleMurni, ailMurni, isCharging);
 
     // ------------------------------------------------------------------------
     // H. SERIAL SOPAN (Hanya cetak jika tuas digeser atau tombol ditekan)
