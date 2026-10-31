@@ -1,119 +1,132 @@
 /*
  * ============================================================================
- * FIRMWARE TRANSMITTER (TX) - V930 RC UNIVERSAL HYBRID (PRO MINI 168P)
+ * FIRMWARE TRANSMITTER (TX) - V930 RC UNIVERSAL HYBRID (PRO MINI)
  * ============================================================================
  * Spesifikasi Hardware & Kelistrikan:
- * - Mikrokontroler : Arduino Pro Mini (ATmega168P - Modif Kristal 8MHz)
- * - Tegangan VCC   : 3.3V Langsung dari LDO Bawaan Board V930
+ * - Mikrokontroler : Arduino Pro Mini (ATmega168P/328P - 3.3V 8MHz)
+ * - Tegangan VCC   : 3.3V (Wajib, bisa dari LDO bawaan board V930)
  * - Potensio Stik  : 3.3V (Pin A0, A1, A2, A3)
- * - Tombol Trim    : 3.3V Resistor Ladder 8 Tombol Bawaan V930 (Pin A4)
- * - Modul NRF24L01 : 3.3V Bawaan V930 (CE = Pin 9, CSN = Pin 10)
+ * - Tombol Trim    : 3.3V Resistor Ladder 8 Tombol (Pin A4)
+ * - Modul NRF24L01 : 3.3V (CE = Pin 9, CSN = Pin 10)
  * - Tombol L & R   : Isolasi Jalur, Menggunakan Pull-Up Internal (Pin 4 & 5)
- * - Indikator      : LED Hijau (Pin 2), LED Merah (Pin 3), Buzzer (Pin 8)
+ * - Indikator      : LED Hijau (Pin 3), LED Merah (Pin 2), Buzzer (Pin 8)
+ * 
+ * ============================================================================
+ * PANDUAN PENGGUNAAN & FITUR TX:
+ * ============================================================================
+ * [TOMBOL R] - ARMING/DISARMING (Menghidupkan/Mematikan Motor):
+ * - Saat di Darat (Gas Nol): Tekan 1x untuk Arm/Disarm cepat.
+ * - Saat di Udara (Gas Naik): Tolak Arming. Wajib tahan 0.6 detik untuk 
+ *                             Emergency Disarm.
+ * 
+ * [TOMBOL L] - MENU KOMBINASI DARAT (Harus kondisi Disarmed):
+ * - Tahan L + Trim Aileron Kanan = Pindah Slot Memori Pesawat (1-10)
+ * - Tahan L + Trim Elevator Bawah= Ganti Tipe Motor (ESC Brushless / MOSFET)
+ * - Tahan L + Trim Elevator Atas = Ganti Mode Terbang (Normal/Glider/Jet/Mobil)
+ * - Tahan L + Trim Aileron Kiri  = Simpan Pengaturan (Save EEPROM)
+ * 
+ * [TOMBOL L] - RESET TRIM INSTAN:
+ * - Saat di Darat (Disarmed): Klik L dengan cepat (<400ms).
+ * - Saat di Udara (Armed): Klik L kapan saja, trim langsung kembali nol.
  * ============================================================================
  */
 
 #include <Arduino.h> // Library utama fungsi dasar Arduino
 #include <SPI.h>     // Library komunikasi protokol SPI untuk modul radio
 #include <RF24.h>    // Library pengendali modul transceiver NRF24L01
-#include <EEPROM.h>  // Library penyimpanan memori permanen di dalam chip Nano
-#include "lcd_h8805a.h"
+#include <EEPROM.h>  // Library penyimpanan memori permanen di dalam chip
+#include "lcd_h8805a.h" // Library khusus untuk mengontrol layar LCD V930
 
 // ============================================================================
-// 1. DEFINISI PIN HARDWARE ARDUINO NANO
+// 1. DEFINISI PIN HARDWARE ARDUINO PRO MINI
 // ============================================================================
 #define PIN_RADIO_CE   9  // Pin Chip Enable untuk mengaktifkan mode kirim/terima NRF24
 #define PIN_RADIO_CSN  10 // Pin Chip Select Not untuk jalur seleksi komunikasi SPI NRF24
 #define PIN_LED_HIJAU  3  // Pin output LED Hijau (Indikator ARMED / Mesin Hidup)
-#define PIN_LED_MERAH  2  // Pin output LED Merah (Indikator DISARM / Mesin Terkunci & Notifikasi)
+#define PIN_LED_MERAH  2  // Pin output LED Merah (Indikator DISARM / Mesin Terkunci)
 #define PIN_BTN_L      4  // Pin input Tombol Bahu Kiri (Menu Konfigurasi & Reset Trim)
 #define PIN_BTN_R      5  // Pin input Tombol Bahu Kanan (Saklar Arming / Disarm)
-#define PIN_BUZZER     8  // Pin output Buzzer aktif untuk alarm dan nada notifikasi
+#define PIN_BUZZER     8  // Pin output Buzzer untuk alarm dan nada notifikasi
 
 const uint8_t PIN_THR  = A2; // Pin input analog Stik Gas (Throttle)
 const uint8_t PIN_RUD  = A3; // Pin input analog Stik Belok Ekor (Rudder)
 const uint8_t PIN_ELE  = A1; // Pin input analog Stik Naik/Turun (Elevator)
 const uint8_t PIN_AIL  = A0; // Pin input analog Stik Kemiringan Sayap (Aileron)
 const uint8_t PIN_TRIM = A4; // Pin input analog Rangkaian 8 Tombol Trim (Resistor Ladder)
-const uint8_t PIN_BAT_TX = A6; // Pin analog pembaca tegangan baterai TX (via Resistor Divider)
-const uint8_t PIN_CHRG   = A7; // Pin sensor TP4056 (Wajib ada resistor pull-up 10k ke 3.3V)
+const uint8_t PIN_BAT_TX = A6; // Pin analog pembaca tegangan baterai internal Remote (TX)
+const uint8_t PIN_CHRG   = A7; // Pin sensor IC Charger TP4056 (Wajib ada resistor pull-up 10k ke 3.3V)
 
-const byte BIND_ADDR[6]  = "BIND0"; // Alamat pipa khusus saat proses Binding
-const uint8_t BIND_CH    = 10;      // Frekuensi channel khusus saat proses Binding
-const uint8_t MAX_MODELS = 10;      // Jumlah maksimal slot memori pesawat di EEPROM
+const byte BIND_ADDR[6]  = "BIND0"; // Alamat pintu darurat khusus saat proses Binding
+const uint8_t BIND_CH    = 10;      // Frekuensi saluran darurat khusus saat proses Binding
+const uint8_t MAX_MODELS = 10;      // Jumlah maksimal kapasitas garasi pesawat di EEPROM
 
 // ============================================================================
-// 2. STRUKTUR DATA KOMUNIKASI RADIO (WAJIB SAMA PERSIS DENGAN RX)
+// 2. STRUKTUR DATA KOMUNIKASI RADIO (WAJIB 100% SAMA DENGAN RX)
 // ============================================================================
-// Struktur paket data untuk mengirim identitas radio saat proses Binding
+// Struktur paket perkenalan (Hanya dipakai 10 detik pertama saat kombinasi tombol L+R)
 struct BindPayload {
-  byte pipeAddr[5];  // 5 byte alamat pipa unik milik slot yang aktif
-  uint8_t opChannel; // 1 byte frekuensi channel operasional milik slot yang aktif
-  uint8_t checkSum;  // 1 byte kode validasi keamanan agar tidak salah tangkap sinyal
+  byte pipeAddr[5];  // 5 huruf acak sebagai password unik untuk RX
+  uint8_t opChannel; // 1 angka saluran frekuensi (20-95) tempat TX/RX akan ngobrol
+  uint8_t checkSum;  // 1 angka gembok verifikasi agar RX tidak menangkap sinyal nyasar
 };
 
-// Struktur paket data utama pengendalian pesawat (Dikirim dari TX ke RX)
+// Struktur paket data kendali pesawat terbang (Dikirim 33x per detik ke RX)
 struct ControlData {
-  uint8_t throttle;  // Nilai gas motor (Rentang: 0 s/d 255)
-  int8_t  rudder;    // Nilai belok rudder (Rentang: -127 s/d 127)
-  int8_t  elevator;  // Nilai naik/turun elevator (Rentang: -127 s/d 127)
-  int8_t  aileron;   // Nilai miring aileron (Rentang: -127 s/d 127)
-  uint8_t isArmed;   // Status kunci keamanan motor (0 = Terkunci/Disarm, 1 = Aktif/Armed)
-  uint8_t auxFlag;   // Pilihan Mode Terbang (1=Normal, 2=Diferensial, 3=Elevon/V-Tail, 4=Daratan)
-  uint8_t motorType; // Pilihan Tipe Penggerak (0 = ESC Brushless, 1 = MOSFET Brushed DC)
+  uint8_t throttle;  // Nilai gas murni + trim (0 s/d 255)
+  int8_t  rudder;    // Nilai belok ekor murni + trim (-127 s/d 127)
+  int8_t  elevator;  // Nilai naik turun murni + trim (-127 s/d 127)
+  int8_t  aileron;   // Nilai miring sayap murni + trim (-127 s/d 127)
+  uint8_t isArmed;   // Bendera keamanan motor (0 = Kunci, 1 = Buka)
+  uint8_t auxFlag;   // Mode Mixer Aerodinamika (1=Pesawat Biasa, 2=Glider, 3=Jet, 4=Mobil)
+  uint8_t motorType; // Jalur distribusi listrik RX (0 = Pin ESC, 1 = Pin MOSFET)
 };
-ControlData txData;  // Deklarasi objek paket kendali
+ControlData txData;  // Membuat kotak nyata penampung paket kendali
 
-// Struktur paket data balasan telemetri (Diterima TX dari titipan ACK RX)
+// Struktur paket laporan kesehatan pesawat (Disedot oleh TX dari dalam RX)
 struct TelemetryData {
-  uint8_t batteryStatus;  // Status baterai dari Auto-Cell RX (0 = Aman, 1 = Baterai Lemah)
-  uint8_t failsafeActive; // Status darurat RX (0 = Sinyal Normal, 1 = RX sedang Failsafe)
+  uint8_t batteryStatus;  // Laporan Voltase Lipo RX (0 = Baterai Penuh/Aman, 1 = Baterai Hampir Habis)
+  uint8_t failsafeActive; // Laporan Status Sinyal RX (0 = Terkendali, 1 = RX sedang panik hilang arah)
 };
-TelemetryData rxTelem;    // Deklarasi objek paket telemetri
+TelemetryData rxTelem;    // Membuat kotak nyata penampung paket laporan
 
 // ============================================================================
 // 3. DEKLARASI OBJEK & VARIABEL GLOBAL SISTEM
 // ============================================================================
-RF24 radio(PIN_RADIO_CE, PIN_RADIO_CSN); // Inisialisasi objek radio NRF24L01
+RF24 radio(PIN_RADIO_CE, PIN_RADIO_CSN); // Menghidupkan mesin penggerak NRF24L01
 
-uint8_t currentSlot     = 1; // Nomor slot model pesawat yang sedang aktif (1 s/d 10)
-byte activePipe[5];          // Menyimpan alamat pipa radio dari slot yang sedang aktif
-uint8_t activeChannel   = 76;// Menyimpan channel frekuensi dari slot yang sedang aktif
-uint8_t activeMode      = 1; // Menyimpan mode terbang aktif (1 s/d 4)
-uint8_t activeMotorType = 0; // Menyimpan tipe motor aktif (0 = ESC, 1 = MOSFET)
+uint8_t currentSlot     = 1; // Posisi aktif memori pesawat (Slot 1 sampai 10)
+byte activePipe[5];          // Password komunikasi pesawat yang sedang aktif
+uint8_t activeChannel   = 76;// Saluran frekuensi pesawat yang sedang aktif
+uint8_t activeMode      = 1; // Mode terbang yang sedang aktif
+uint8_t activeMotorType = 0; // Tipe distribusi motor yang sedang aktif
 
-// Variabel penyimpan nilai geseran Trim untuk 4 sumbu kendali
-int throttleTrim = 0; // Geseran trim gas (-127 s/d 127)
-int rudderTrim   = 0; // Geseran trim rudder (-127 s/d 127)
-int elevatorTrim = 0; // Geseran trim elevator (-127 s/d 127)
-int aileronTrim  = 0; // Geseran trim aileron (-127 s/d 127)
+// Memori Geseran Tuas Trim (-127 s/d 127)
+int throttleTrim = 0; 
+int rudderTrim   = 0; 
+int elevatorTrim = 0; 
+int aileronTrim  = 0; 
 
-// Variabel pewaktu pengiriman radio dan pemantauan sinyal
-unsigned long lastTxTime  = 0;  // Mencatat waktu terakhir paket kendali dikirim
-const unsigned long TX_INTERVAL = 30; // Jeda pengiriman paket radio (30ms = ~33 Hz)
-unsigned long lastAckTime = 0;  // Mencatat waktu terakhir menerima balasan telemetri dari RX
+unsigned long lastTxTime  = 0; // Stopwatch ritme pengiriman data radio
+const unsigned long TX_INTERVAL = 30; // 30ms = Remote mengirim perintah 33 kali dalam satu detik
+unsigned long lastAckTime = 0; // Stopwatch ritme balasan kesehatan pesawat (Untuk deteksi sinyal putus)
 
+bool isArmed           = false; // Bendera utama keselamatan pilot: Wajib false (Terkunci) saat mesin menyala
 
-// Variabel keamanan motor dan penghalus pergerakan tuas gas
-bool isArmed           = false; // Status mesin (Default awal wajib false / terkunci)
-// float smoothedThr      = 0;     // Nilai hasil filter penghalus EMA pada tuas gas
-// const float EMA_ALPHA  = 0.15;  // Koefisien kelembutan filter EMA (0.15 = responsif & halus)
-
-// Variabel manajemen Buzzer & LED Non-Blocking (Tanpa menghentikan laju program)
-unsigned long buzzerEndTime = 0;     // Waktu target kapan buzzer harus berhenti berbunyi
-bool buzzerActive           = false; // Status apakah buzzer sedang dalam masa aktif bunyi
+// --- SISTEM MANAJEMEN BUZZER CERDAS (NON-BLOCKING) ---
+unsigned long buzzerEndTime = 0; 
+bool buzzerActive           = false; 
 uint8_t beepState = 0; 
 unsigned long beepTimer = 0;
 unsigned int beepInterval = 0;
-// --- TAMBAHAN UNTUK BUZZER HYBRID ---
-const bool PAKE_BUZZER_PASIF = true;  // Set 'true' untuk Buzzer Pasif, 'false' untuk Buzzer Aktif
-const int FREKUENSI_BUZZER = 2500;    // Nada frekuensi 2.5kHz (Bisa diubah: 1000 - 4000)
-// ------------------------------------
+
+// Opsi Hardware Buzzer:
+const bool PAKE_BUZZER_PASIF = true;  // Ubah ke 'false' jika modul buzzer Anda adalah tipe aktif (2 kaki biasa)
+const int FREKUENSI_BUZZER = 2500;    // Tingkat lengkingan suara (Hanya berefek jika pakai pasif)
 
 // ============================================================================
 // 4. FUNGSI KENDALI AUDIO (BUZZER) & VISUAL (LED MERAH/HIJAU)
 // ============================================================================
-// Fungsi cerdas penggerak Buzzer (Hybrid)
+// Pengendali fisik tegangan ke kaki Buzzer
 void nyalakanBuzzer(bool nyala) {
   if (nyala) {
     if (PAKE_BUZZER_PASIF) tone(PIN_BUZZER, FREKUENSI_BUZZER);
@@ -123,16 +136,17 @@ void nyalakanBuzzer(bool nyala) {
     else digitalWrite(PIN_BUZZER, LOW);  
   }
 }
-// Fungsi bip tunggal dengan pelindung Anti-Spam
+
+// Bip Cepat: Bunyi sekali lalu otomatis mati (Sangat berguna saat menerbangkan agar kode tidak macet)
 void beep(unsigned int duration) {
-  if (beepState != 0) return; // KUNCI: Tolak perintah masuk jika buzzer masih bunyi!
+  if (beepState != 0) return; // Anti-Spam: Tolak jika mulut buzzer masih penuh menyuarakan perintah lain
   beepState = 1;
   beepInterval = duration;
   beepTimer = millis();
   buzzerActive = true; 
 }
 
-// Fungsi bip ganda non-blocking (Opsional untuk menu konfigurasi)
+// Bip Ganda Cepat: Khusus digunakan sebagai notifikasi penggantian menu
 void beepDouble() {
   if (beepState != 0) return;
   beepState = 3; 
@@ -141,42 +155,41 @@ void beepDouble() {
   buzzerActive = true; 
 }
 
-// Fungsi pengatur nyala/kedip LED dan Buzzer yang dipanggil terus-menerus di loop()
+// Mesin pemutar suara dan lampu di latar belakang (Dipanggil setiap putaran loop)
 void handleAudioVisual() {
-  unsigned long m = millis(); // Ambil waktu sistem saat ini
-  bool isBuzzerOn = false;    // Penanda apakah detik ini pin buzzer sedang menyala
+  unsigned long m = millis(); 
+  bool isBuzzerOn = false;    
 
-  // --- MESIN STATUS BUZZER NON-BLOCKING ---
+  // --- PEMROSES SUARA DI LATAR BELAKANG ---
   if (beepState > 0) {
-    // Nyala saat state 1 (Bip Tunggal) atau 3 (Bip Pertama Nada Ganda)
     if (beepState == 1 || beepState == 3) {
       nyalakanBuzzer(true);
       isBuzzerOn = true;
     } else {
-      nyalakanBuzzer(false); // Matikan saat state 2 (Fase Jeda)
+      nyalakanBuzzer(false); // Mode 2: Diam sesaat sebelum lanjut bunyi lagi
       isBuzzerOn = false;
     }
     
-    // Cek apakah durasi interval saat ini sudah habis
+    // Cek apakah waktu berbunyi (atau waktu diam) sudah habis
     if (m - beepTimer >= beepInterval) {
       if (beepState == 1) { 
-        // Selesai bip tunggal -> Matikan total
+        // Akhir dari bunyi tunggal, bersihkan memori
         nyalakanBuzzer(false);
         beepState = 0; 
         buzzerActive = false;
         isBuzzerOn = false;
       } 
       else if (beepState == 3) {
-        // Selesai bip pertama -> Masuk jeda diam
+        // Bunyi pertama selesai, mulai masuk jeda diam
         nyalakanBuzzer(false);
         beepState = 2; 
-        beepInterval = 80; // Jeda diam 80 milidetik
+        beepInterval = 80; // Diam selama 80 milidetik
         beepTimer = m;
         isBuzzerOn = false;
       }
       else if (beepState == 2) {
-        // Jeda diam selesai -> Mulai bip kedua
-        beepState = 1; // Ubah ke logika bip tunggal untuk akhiran
+        // Diam selesai, mulai mainkan bunyi kedua
+        beepState = 1; 
         beepInterval = 100; 
         beepTimer = m;
       }
@@ -185,48 +198,46 @@ void handleAudioVisual() {
     buzzerActive = false;
   }
 
-  // Logika Indikator LED Utama & Ilusi Kedipan Notifikasi
+  // --- PEMROSES CAHAYA INDIKATOR (EFEK SILANG) ---
   if (isArmed) {
-    // KONDISI ARMED (Mesin Hidup): LED Hijau nyala konstan.
-    // Jika buzzer berbunyi, matikan Hijau sesaat dan nyalakan Merah (efek kedip peringatan)
+    // Mode Bahaya (Hijau): Jika buzzer nyala, hijau mati, merah nyala. (Efek alarm kelap-kelip merah cepat)
     digitalWrite(PIN_LED_HIJAU, isBuzzerOn ? LOW : HIGH);
     digitalWrite(PIN_LED_MERAH, isBuzzerOn ? HIGH : LOW);
   } else {
-    // KONDISI DISARM (Mesin Mati): LED Merah nyala konstan sebagai tanda power remote ON.
-    // Jika buzzer berbunyi, matikan Merah sesaat agar terlihat berkedip mengikuti irama suara
+    // Mode Darat (Merah): Jika buzzer nyala, merah mati, hijau mati. (Efek merah berkedip kalem)
     digitalWrite(PIN_LED_HIJAU, LOW);
     digitalWrite(PIN_LED_MERAH, isBuzzerOn ? LOW : HIGH);
   }
 }
 
-// Fungsi bunyi dengan jeda kaku (Hanya dipakai saat Booting atau Menu di darat/Disarm)
+// Bip Klasik (Blocking): Menghentikan total laju kode TX selama durasi (Hanya aman dipanggil di Setup/Darat)
 void beepBlocking(unsigned int duration) {
-  nyalakanBuzzer(true);    // Nyalakan buzzer
-  digitalWrite(PIN_LED_MERAH, LOW);  // Kedipkan LED merah (mati sesaat)
-  delay(duration);                   // Tahan selama durasi
-  nyalakanBuzzer(false);     // Matikan buzzer
-  digitalWrite(PIN_LED_MERAH, HIGH); // Nyalakan kembali LED merah
+  nyalakanBuzzer(true);    
+  digitalWrite(PIN_LED_MERAH, LOW);  // Padamkan merah sebentar
+  delay(duration);                   // Gembok Arduino total!
+  nyalakanBuzzer(false);     
+  digitalWrite(PIN_LED_MERAH, HIGH); // Nyalakan kembali
 }
 
 // ============================================================================
-// 5. FUNGSI MANAJEMEN MEMORI EEPROM (10 SLOT MODEL PESAWAT)
+// 5. FUNGSI MANAJEMEN MEMORI EEPROM (RUANG 10 SLOT PESAWAT)
 // ============================================================================
-// Menghitung alamat awal byte EEPROM untuk masing-masing slot (Tiap slot diberi ruang 15 byte)
+// Mencari tahu alamat laci penyimpanan untuk slot tertentu
 int getSlotOffset(uint8_t slot) {
-  return 100 + ((slot - 1) * 15); // Slot 1 mulai di alamat 100, Slot 2 di 115, dst.
+  return 100 + ((slot - 1) * 15); // Laci Slot 1 dimulai di byte ke-100, tiap laci muat 15 byte.
 }
 
-// Menyimpan konfigurasi mode, trim, dan tipe motor ke slot EEPROM yang sedang aktif
+// Mengunci settingan pesawat saat ini ke dalam memori chip agar tidak hilang saat baterai dicabut
 void saveConfigToSlot() {
-  int offset = getSlotOffset(currentSlot); // Cari alamat EEPROM untuk slot saat ini
-  EEPROM.update(offset + 7,  activeMode);                  // Simpan mode terbang
-  EEPROM.update(offset + 8,  (uint8_t)(throttleTrim + 128)); // Simpan trim gas (+128 agar positif)
-  EEPROM.update(offset + 9,  (uint8_t)(rudderTrim + 128));   // Simpan trim rudder
-  EEPROM.update(offset + 10, (uint8_t)(elevatorTrim + 128)); // Simpan trim elevator
-  EEPROM.update(offset + 11, (uint8_t)(aileronTrim + 128));  // Simpan trim aileron
-  EEPROM.update(offset + 12, activeMotorType);             // Simpan tipe motor (ESC/MOSFET)
+  int offset = getSlotOffset(currentSlot); 
+  EEPROM.update(offset + 7,  activeMode);                  // Mengamankan Mode Terbang
+  EEPROM.update(offset + 8,  (uint8_t)(throttleTrim + 128)); // Mengamankan Trim Gas (Disuntik +128 agar menghindari minus)
+  EEPROM.update(offset + 9,  (uint8_t)(rudderTrim + 128));   // Mengamankan Trim Ekor
+  EEPROM.update(offset + 10, (uint8_t)(elevatorTrim + 128)); // Mengamankan Trim Sayap Ekor
+  EEPROM.update(offset + 11, (uint8_t)(aileronTrim + 128));  // Mengamankan Trim Sayap Utama
+  EEPROM.update(offset + 12, activeMotorType);             // Mengamankan Tipe Distribusi Listrik
 
-  // Bunyikan nada melodi konfirmasi penyimpanan berhasil
+  // Konser mini 3 nada sukses menyimpan
   beepBlocking(100); delay(150);
   beepBlocking(100); delay(150);
   beepBlocking(300);
@@ -235,49 +246,48 @@ void saveConfigToSlot() {
   Serial.println(currentSlot);
 }
 
-// Memuat data konfigurasi pesawat dari slot EEPROM yang dipilih
+// Memanggil/menarik memori pesawat tertentu dari EEPROM untuk digunakan terbang
 void loadModel(uint8_t slot) {
-  int offset = getSlotOffset(slot); // Hitung alamat memori slot tujuan
+  int offset = getSlotOffset(slot); 
 
-  // Cek apakah slot ini belum pernah dipakai (Byte pengenal bukan 0xAA)
+  // Pengecekan Segel (0xAA). Jika segel belum ada, berarti ini slot baru dari pabrik
   if (EEPROM.read(offset) != 0xAA) {
     Serial.print(F("[EEPROM] Memformat Slot Baru: "));
     Serial.println(slot);
-    EEPROM.update(offset, 0xAA);                     // Tulis segel pengenal bahwa slot sudah terisi
-    EEPROM.update(offset + 1, random(20, 95));       // Buat frekuensi channel acak yang aman (20-94)
+    EEPROM.update(offset, 0xAA);                     // Segel bahwa laci ini sudah ada yang punya
+    EEPROM.update(offset + 1, random(20, 95));       // Ciptakan frekuensi channel dadakan (20-94)
     for (int i = 0; i < 5; i++) {
-      EEPROM.update(offset + 2 + i, 'A' + random(0, 26)); // Buat 5 huruf alamat pipa acak (A-Z)
+      EEPROM.update(offset + 2 + i, 'A' + random(0, 26)); // Ciptakan 5 huruf acak (Misal: "XZGHY") untuk alamat
     }
-    EEPROM.update(offset + 7,  1);   // Default Mode Terbang = 1 (Normal)
-    EEPROM.update(offset + 8,  128); // Default Trim Throttle = 0 (128 - 128 = 0)
-    EEPROM.update(offset + 9,  128); // Default Trim Rudder   = 0
-    EEPROM.update(offset + 10, 128); // Default Trim Elevator = 0
-    EEPROM.update(offset + 11, 128); // Default Trim Aileron  = 0
-    EEPROM.update(offset + 12, 0);   // Default Tipe Motor    = 0 (ESC Brushless)
+    EEPROM.update(offset + 7,  1);   // Isi dengan Normal Mode
+    EEPROM.update(offset + 8,  128); // Nolkan Trim (128 berarti 0)
+    EEPROM.update(offset + 9,  128); 
+    EEPROM.update(offset + 10, 128); 
+    EEPROM.update(offset + 11, 128); 
+    EEPROM.update(offset + 12, 0);   // Isi dengan ESC Brushless Mode
   }
 
-  // Baca seluruh parameter dari EEPROM ke variabel aktif di RAM
-  activeChannel = EEPROM.read(offset + 1);                // Ambil frekuensi channel
+  // Tumpahkan isi EEPROM ke RAM untuk segera digunakan
+  activeChannel = EEPROM.read(offset + 1);                
   for (int i = 0; i < 5; i++) {
-    activePipe[i] = EEPROM.read(offset + 2 + i);          // Ambil 5 byte alamat pipa
+    activePipe[i] = EEPROM.read(offset + 2 + i);          
   }
-  activeMode      = EEPROM.read(offset + 7);              // Ambil mode terbang
-  throttleTrim    = (int)EEPROM.read(offset + 8) - 128;   // Ambil trim gas (kembalikan ke skala minus/plus)
-  rudderTrim      = (int)EEPROM.read(offset + 9) - 128;   // Ambil trim rudder
-  elevatorTrim    = (int)EEPROM.read(offset + 10) - 128;  // Ambil trim elevator
-  aileronTrim     = (int)EEPROM.read(offset + 11) - 128;  // Ambil trim aileron
-  activeMotorType = EEPROM.read(offset + 12);             // Ambil tipe motor
+  activeMode      = EEPROM.read(offset + 7);              
+  throttleTrim    = (int)EEPROM.read(offset + 8) - 128;   // Obati hasil suntikan +128 tadi agar bisa minus kembali
+  rudderTrim      = (int)EEPROM.read(offset + 9) - 128;   
+  elevatorTrim    = (int)EEPROM.read(offset + 10) - 128;  
+  aileronTrim     = (int)EEPROM.read(offset + 11) - 128;  
+  activeMotorType = EEPROM.read(offset + 12);             
 
-  EEPROM.update(50, slot); // Catat nomor slot terakhir yang dipakai di alamat 50
-  currentSlot = slot;      // Perbarui variabel slot aktif saat ini
+  EEPROM.update(50, slot); // Catat di buku tamu (Alamat 50) pesawat mana yang terakhir kali dipakai
+  currentSlot = slot;      // Perbarui posisi memori RAM saat ini
 
-  // Beri tanda bunyi buzzer sebanyak nomor slot yang dimuat
+  // Konser pemberitahuan: Titik-titik suara sejumlah urutan slot memori
   for (int i = 0; i < slot; i++) {
     beepBlocking(100);
     delay(200);
   }
 
-  // Cetak informasi lengkap slot ke Serial Monitor untuk keperluan debugging
   Serial.print(F("[EEPROM] Berhasil Load Slot: ")); Serial.print(slot);
   Serial.print(F(" | Ch: ")); Serial.print(activeChannel);
   Serial.print(F(" | Mode: ")); Serial.print(activeMode);
@@ -285,27 +295,27 @@ void loadModel(uint8_t slot) {
 }
 
 // ============================================================================
-// 6. FUNGSI PROSES BINDING (PENCOCOKAN ID TX KE RX SELAMA 10 DETIK)
+// 6. FUNGSI PROSES BINDING (MENJODOHKAN RX BARU SELAMA 10 DETIK)
 // ============================================================================
 void executeBindingProcess() {
   Serial.println(F("[BIND] Memulai Proses Pancaran Binding 10 Detik..."));
-  radio.stopListening();             // 1. WAJIB DIATAS! Ubah jadi pemancar.
-  radio.setChannel(BIND_CH);         // 2. Set frekuensi
-  radio.openWritingPipe(BIND_ADDR);  // 3. Masukkan alamat "BIND0"
+  radio.stopListening();             // Wajib kosongkan telinga sebelum jadi penyiar radio
+  radio.setChannel(BIND_CH);         // Geser ke frekuensi siaran darurat (Channel 10)
+  radio.openWritingPipe(BIND_ADDR);  // Siarkan dengan label amplop "BIND0"
 
-  // Siapkan isi paket identitas yang akan dikirim ke RX
+  // Susun data perkenalan untuk dilempar ke udara
   BindPayload bp;
-  memcpy(bp.pipeAddr, activePipe, 5); // Salin 5 byte alamat pipa dari slot aktif saat ini
-  bp.opChannel = activeChannel;       // Masukkan nomor frekuensi channel operasional
-  bp.checkSum  = activeChannel ^ bp.pipeAddr[0] ^ bp.pipeAddr[4]; // Buat rumus validasi XOR
+  memcpy(bp.pipeAddr, activePipe, 5); // Tawarkan RX untuk memakai password acak yang tadi dibuat di loadModel()
+  bp.opChannel = activeChannel;       // Tawarkan RX untuk bertemu di frekuensi acak tersebut
+  bp.checkSum  = activeChannel ^ bp.pipeAddr[0] ^ bp.pipeAddr[4]; // Segel pakai XOR Math
 
-  unsigned long bindStartTime = millis(); // Catat waktu dimulainya proses binding
+  unsigned long bindStartTime = millis(); 
 
-  // Pancarkan paket identitas terus-menerus selama 10.000 milidetik (10 detik)
+  // Pesta siaran berulang-ulang tanpa henti selama 10 Detik!
   while (millis() - bindStartTime < 10000) {
-    radio.write(&bp, sizeof(BindPayload)); // Pancarkan paket binding ke udara
+    radio.write(&bp, sizeof(BindPayload)); // Lempar data perkenalan
 
-    // Nyalakan Buzzer & Kedipkan LED Merah-Hijau secara bergantian (Silang)
+    // Efek Disko Silang Merah Hijau sambil Buzzer bernyanyi
     nyalakanBuzzer(true);
     digitalWrite(PIN_LED_MERAH, HIGH);
     digitalWrite(PIN_LED_HIJAU, LOW);
@@ -317,236 +327,246 @@ void executeBindingProcess() {
     delay(80);
   }
 
-  // Kembalikan kondisi LED dan beri bunyi panjang tanda selesai binding
+  // Waktu habis, kembalikan kosmetik LED
   digitalWrite(PIN_LED_HIJAU, LOW);
   beepBlocking(500);
   Serial.println(F("[BIND] Selesai! Kembali ke Frekuensi Operasional."));
 }
 
 // ============================================================================
-// 7. FUNGSI KONVERSI & KALIBRASI STIK ANALOG (-127 S/D 127)
+// 7. FUNGSI KONVERSI STIK ANALOG JADUL MENJADI PRESISI DIGITAL 
 // ============================================================================
+// Fungsi ini membuang "deadzone" (ruang goyang kosong) di tengah tuas stik V930
 int mapJoystick(int val, int lower, int middle, int upper) { 
   val = constrain(val, lower, upper);
   int output = 0;
 
+  // Jika stik digeser menjauhi tengah ke arah bawah/kiri (Melewati batas 15 angka getar tangan)
   if (val < middle - 15) {
-    output = map(val, lower, middle - 15, -127, 0);
-  } else if (val > middle + 15) {
-    output = map(val, middle + 15, upper, 0, 127);
+    output = map(val, lower, middle - 15, -127, 0); // Konversi murni jadi -127 s.d 0
+  } 
+  // Jika stik digeser menjauhi tengah ke arah atas/kanan 
+  else if (val > middle + 15) {
+    output = map(val, middle + 15, upper, 0, 127);  // Konversi murni jadi 0 s.d 127
   }
 
-  return output; // Hanya mengembalikan nilai stik murni
+  return output; 
 }
 
 // ============================================================================
-// 8. FUNGSI UTAMA: SETUP (DIJALANKAN 1 KALI SAAT REMOTE DINYALAKAN)
+// 8. FUNGSI UTAMA: SETUP (HANYA DIPANGGIL 1x SAAT REMOTE DICETEK ON)
 // ============================================================================
 void setup() {
-  // BOARD NANO WAJIB: Gunakan tegangan 3.3V dari pin AREF sebagai batas atas pembacaan analog (1023 = 3.3V)
-  // BOARD PROMINI 8MHZ: Cukup beri komentar
+  // PENGAMANAN PENGUKURAN LISTRIK
+  // Arduino Pro Mini 3.3V otomatis memakai rel VCC (3.3V) sebagai penggaris 1023 analogRead.
+  // Jangan aktifkan EXTERNAL karena akan mengacaukan pembacaan ADC dari potensio stik (kecuali pin AREF disambung ke VCC).
   // analogReference(EXTERNAL);  
 
-  Serial.begin(115200); // Buka komunikasi Serial Monitor pada kecepatan 115200 bps
+  Serial.begin(115200); 
 
-  // Konfigurasi pin output indikator
   pinMode(PIN_LED_HIJAU, OUTPUT);
   pinMode(PIN_LED_MERAH, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
 
-  // WAJIB: Gunakan INPUT_PULLUP internal 3.3V Pro Mini untuk tombol L & R (Aman tersambung ke GND)
+  // MENGAMANKAN TOMBOL DARAT:
+  // Tombol fisik dipasang dari Pin 4 dan 5 lalu ke Kabel Ground (Tanpa tegangan positif luar).
+  // Fungsi INPUT_PULLUP memaksa pin mengeluarkan 3.3V gaib dari dalam chip.
+  // Ketika dipencet, listrik 3.3V gaib itu bocor ke tanah (Ground/LOW). 
   pinMode(PIN_BTN_L, INPUT_PULLUP);
   pinMode(PIN_BTN_R, INPUT_PULLUP);
 
-  // Pastikan buzzer mati dan LED Merah menyala di awal booting
   nyalakanBuzzer(false);
   digitalWrite(PIN_LED_MERAH, HIGH);
   digitalWrite(PIN_LED_HIJAU, LOW);
 
-  // Beri jeda 50ms agar tegangan Pull-Up 3.3V pada pin 4 & 5 stabil sepenuhnya sebelum dibaca
-  delay(50);
+  delay(50); // Tarik nafas, tunggu listrik 3.3V gaib stabil merambat di tembaga tombol L & R
 
-  // Ambil bibit angka acak dari derau pin analog kosong untuk pembuatan ID slot baru
+  // Semburkan angka acak dari derau kosmik (listrik liar) di udara pada dua pin analog nganggur
+  // Digunakan sebagai bibit pembangkit alamat/frekuensi untuk pesawat baru.
   randomSeed(analogRead(A6) + analogRead(A7));
 
-  // Baca memori slot terakhir yang digunakan dari alamat EEPROM 50
+  // Mengintip buku tamu, pesawat mana yang kemarin siang terakhir diterbangkan
   uint8_t lastSlot = EEPROM.read(50);
   if (lastSlot < 1 || lastSlot > MAX_MODELS) {
-    lastSlot = 1; // Jika nilai di luar batas (EEPROM baru), paksa ke Slot 1
+    lastSlot = 1; // Jika ini chip perawan (isinya 255), paksa mulai dari pesawat nomer 1
   }
-  loadModel(lastSlot); // Muat seluruh pengaturan dari slot tersebut
+  loadModel(lastSlot); 
 
-  // Inisialisasi dan periksa koneksi fisik modul NRF24L01
+  // PENGUJIAN JANTUNG NRF24L01
   if (!radio.begin()) {
-    Serial.println(F("[FATAL] Modul NRF24L01 Tidak Terdeteksi! Cek Jalur SPI/3.3V!"));
+    Serial.println(F("[FATAL] Modul NRF24L01 Tidak Terdeteksi! Cek Kabel MISO/MOSI/SCK & Power 3.3V!"));
     while (1) {
+      // Jika NRF rusak, matikan total remote. Beri kedipan horor tanda berkabung.
       digitalWrite(PIN_LED_MERAH, !digitalRead(PIN_LED_MERAH));
       delay(100);
     }
   }
 
-  // Konfigurasi parameter komunikasi radio NRF24L01
-  radio.setPALevel(RF24_PA_HIGH); // HIGH agar pancaran radio kuat
-  radio.setDataRate(RF24_1MBPS); // 250kbps = Jarak jauh & stabil, 1Mbps = Jarak pendek & cepat
-  radio.setRetries(1, 3); // Jeda 500us, dicoba 3x. Total hanya 1.5ms (Aman dari macet & ACK tertangkap!)
-  radio.enableDynamicPayloads();  
-  radio.enableAckPayload();       
+  radio.setPALevel(RF24_PA_HIGH); // Bakar daya baterai agak besar agar antena memancar kuat
+  radio.setDataRate(RF24_1MBPS);  // 1MBPS optimal menembus tembok hobi RC jarak pandang mata
+  
+  // ANTI TABRAKAN SINYAL:
+  // Tunggu 500 mikrodetik, jika pesawat gagal membalas, tembak lagi. Coba sampai 3 kali maksimal.
+  radio.setRetries(1, 3); 
+  radio.enableDynamicPayloads();  // Izinkan kantong data melar memendek dinamis
+  radio.enableAckPayload();       // AKTIFKAN TELEMETRI: Intip apakah pesawat menitipkan rapor kesehatan
 
-  // Cek apakah pengguna menahan Tombol L dan R bersamaan saat menyalakan remote
+  // TINDAKAN RAHASIA 10 DETIK (Tahan Bahu L & R Kiri Kanan serentak)
   if (digitalRead(PIN_BTN_L) == LOW && digitalRead(PIN_BTN_R) == LOW) {
     executeBindingProcess(); 
   }
 
-  // Setel radio ke frekuensi dan alamat pipa operasional sesuai slot aktif
-  radio.stopListening();          // WAJIB dipanggil SEBELUM openWritingPipe!
+  // Setelah siap tempur, putar siaran TX ke frekuensi spesifik milik pesawat yang dipanggil
+  radio.stopListening();          // Tutup telinga sebelum memutar frekuensi
   radio.setChannel(activeChannel);
   radio.openWritingPipe(activePipe);
-  delay(10);                      // Beri waktu 10ms agar register PLL frekuensi NRF terkunci
+  delay(10);                      // Biarkan chip radio mengunci (PLL Lock) agar tidak bocor frekuensi
 
   isArmed = false;
   lastAckTime = millis(); 
   beepBlocking(200);
-  initLCD();      
-  Serial.println(F("[SYSTEM] TX V930 Siap Beroperasi. Status: DISARMED (Mesin Terkunci)."));
+  initLCD();      // Nyalakan layar peninggalan pesawat V930
+  Serial.println(F("[SYSTEM] TX Siap Tempur. Kondisi: DISARMED."));
 }
 
 // ============================================================================
-// 9. FUNGSI UTAMA: LOOP (DIJALANKAN BERULANG-ULANG TANPA HENTI)
+// 9. FUNGSI UTAMA: LOOP (BERJALAN SEPERTI MESIN MOBIL MENDERU)
 // ============================================================================
 void loop() {
-  unsigned long currentMillis = millis(); // Ambil waktu sistem berjalan saat ini
-  handleAudioVisual();                    // Kelola bunyi Buzzer dan nyala LED secara Non-Blocking
+  unsigned long currentMillis = millis(); 
+  handleAudioVisual(); // Urus suara buzzer dan nyala lampu di latar belakang tanpa mengganggu
 
- // --------------------------------------------------------------------------
-  // A. PEMANTAUAN ALARM TELEMETRI BATERAI (SABAR)
+  // --------------------------------------------------------------------------
+  // A. SISTEM PERINGATAN BAHAYA DARI PESAWAT (TELEMETRI BATERAI LIPO RX)
   // --------------------------------------------------------------------------
   static unsigned long lastAlarmTime = 0; 
-  if (isArmed) {
-    // KITA HAPUS ALARM KEKUATAN SINYAL, HANYA SISA ALARM BATERAI
-    if (rxTelem.batteryStatus == 1) {
+  if (isArmed) { // Hanya perdulikan teriakan pesawat jika mesin sedang menyala terbang
+    if (rxTelem.batteryStatus == 1) { // Baterai Pesawat Lemah!
       if (currentMillis - lastAlarmTime > 2500) {
-        beep(500);
+        beep(500); // Bip mengerikan panjang setiap 2.5 detik
         lastAlarmTime = currentMillis;
       }
     }
   }
 
   // --------------------------------------------------------------------------
-  // B. SIKLUS PEMBACAAN INPUT & PENGIRIMAN RADIO (SETIAP 30 MILIDETIK)
+  // B. DETAK JANTUNG PENGENDALIAN PESAWAT (EKSEKUSI TIAP 30 MILIDETIK)
   // --------------------------------------------------------------------------
   if (currentMillis - lastTxTime >= TX_INTERVAL) {
-    lastTxTime = currentMillis; // Perbarui waktu eksekusi siklus
+    lastTxTime = currentMillis; 
 
-    // 1. Baca nilai tegangan analog mentah (0 - 1023) dari keempat potensio stik & tombol trim
-    int rawThr  = analogRead(PIN_THR);  // Baca Stik Gas
-    int rawRud  = analogRead(PIN_RUD);  // Baca Stik Rudder
-    int rawEle  = analogRead(PIN_ELE);  // Baca Stik Elevator
-    int rawAil  = analogRead(PIN_AIL);  // Baca Stik Aileron
-    int rawTrim = analogRead(PIN_TRIM); // Baca Rangkaian Resistor Ladder 8 Tombol Trim
+    // 1. Sedot tegangan voltase riil dari gerakan tangan Anda di atas potensio tuas V930 (0 - 1023)
+    int rawThr  = analogRead(PIN_THR);  
+    int rawRud  = analogRead(PIN_RUD);  
+    int rawEle  = analogRead(PIN_ELE);  
+    int rawAil  = analogRead(PIN_AIL);  
+    int rawTrim = analogRead(PIN_TRIM); // Deteksi pencetan resistor dari papan tombol TRIM
 
-    // 2. Baca status penekanan Tombol Bahu L dan R (Bernilai true jika ditekan ke GND / LOW)
+    // 2. Baca apakah jari Anda meremas pundak remote (Tombol bahu L/R)
     bool btnL = (digitalRead(PIN_BTN_L) == LOW);
     bool btnR = (digitalRead(PIN_BTN_R) == LOW);
 
     // ------------------------------------------------------------------------
-    // C. LOGIKA TOMBOL R (ARMING & DISARM AMAN TANPA BLOCKING)
+    // C. LOGIKA TOMBOL R KANAN (TOMBOL MAUT: ARMING / DISARMING MOTOR)
     // ------------------------------------------------------------------------
-    // - Saat di darat (Gas Nol): Klik R langsung mengubah Arm <-> Disarm dengan cepat.
-    // - Saat terbang (Gas Naik): Wajib tahan R selama 0.6 detik untuk Disarm (Cegah tersenggol).
-    static unsigned long btnRPressTime = 0; // Mencatat kapan tombol R mulai ditekan
-    static bool btnRWasPressed = false;     // Status apakah tombol R sedang ditahan
-    static bool disarmHandled  = false;     // Mencegah pemicuan ganda saat tombol ditahan lama
+    static unsigned long btnRPressTime = 0; 
+    static bool btnRWasPressed = false;     
+    static bool disarmHandled  = false;     
 
     if (btnR && !btnL) {
-      // Deteksi awal saat jari baru menyentuh tombol R
       if (!btnRWasPressed) {
         btnRPressTime  = currentMillis;
         btnRWasPressed = true;
         disarmHandled  = false;
 
-        // Jika kondisi sedang DISARM -> Proses permintaan ARMING seketika (1 Klik)
         if (!isArmed) {
+          // SYARAT MUTLAK ARMING: Tuas Gas Wajib Mentok Bawah (Nol)
           if (rawThr > 40) {
-            // Tolak Arming jika tuas gas belum berada di posisi paling bawah
-            beepBlocking(80); delay(80); beepBlocking(80); // <--- INI UBAHANNYA (2x Bip)
-            Serial.println(F("[WARNING] Arming Ditolak! Turunkan Tuas Gas ke Nol!"));
+            // Jika ada orang rese yang menghidupkan mesin sambil menekan gas, TOLAK!
+            beepBlocking(80); delay(80); beepBlocking(80); 
+            Serial.println(F("[WARNING] Ditolak! Tangan Nakal, Turunkan Tuas Gas Dulu!"));
           } else {
-            // Izinkan Arming karena gas sudah aman di posisi nol
-            isArmed = true;
-            beep(600);
-            Serial.println(F("[MOTOR] STATUS: ARMED! Motor Siap Berputar!"));
+            isArmed = true; // Buka gerbang listrik motor di pesawat
+            beep(600);      // Bip panjang tanda Bahaya dimulai
+            Serial.println(F("[MOTOR] ARMED!"));
           }
-          disarmHandled = true; // Tandai aksi sudah selesai untuk tekanan ini
+          disarmHandled = true; 
         }
-        // Jika sedang ARMED dan tuas gas sudah di nol (di darat) -> Langsung Disarm dengan 1 Klik!
         else if (isArmed && rawThr <= 40) {
+          // Klik Disarm di Darat: Matikan instan
           isArmed = false;
           beep(200);
-          Serial.println(F("[MOTOR] STATUS: DISARMED! (Gas Nol - Klik Instan)"));
+          Serial.println(F("[MOTOR] DISARMED (Klik Instan Darat)"));
           disarmHandled = true;
         }
       }
 
-      // Jika sedang ARMED dan gas sedang menyala (di udara) -> Wajib tahan 600ms untuk Disarm Darurat
+      // EMERGENCY DISARM UDARA: Jika mesin menyala dan gas sedang ditarik tinggi, 
+      // klik pelan tombol R akan diabaikan (anti kesenggol jari). 
+      // Wajib tahan dengan kuat 0.6 detik berturut-turut untuk mematikan motor!
       if (isArmed && !disarmHandled && (currentMillis - btnRPressTime > 600)) {
         isArmed = false;
         beep(400);
-        Serial.println(F("[MOTOR] STATUS: EMERGENCY DISARM! (Tahan 0.6 Detik)"));
+        Serial.println(F("[MOTOR] EMERGENCY DISARM! (Tahan 0.6s)"));
         disarmHandled = true;
       }
     } else if (!btnR) {
-      btnRWasPressed = false; // Reset status ketika jari dilepas dari tombol R
+      btnRWasPressed = false; 
     }
 
     // ------------------------------------------------------------------------
-    // D. LOGIKA TOMBOL L (MENU KOMBINASI & RESET TRIM CERDAS)
+    // D. LOGIKA TOMBOL L KIRI (TOMBOL CERDAS: RESET TRIM & MASUK MENU SISTEM)
     // ------------------------------------------------------------------------
     static bool btnLWasPressed = false;
     static unsigned long btnLPressTime = 0;
     static unsigned long lastMenuTime = 0;
     static bool menuExecuted = false;
-    const unsigned long SHORT_CLICK_MAX = 400; // Batas waktu klik pendek (400 milidetik)
+    const unsigned long SHORT_CLICK_MAX = 400; // Kalau ditahan < 400ms artinya dia mau klik cepat (Reset)
 
     if (btnL && !btnR) {
-      // Deteksi awal saat jari baru menyentuh tombol L
       if (!btnLWasPressed) {
         btnLWasPressed = true;
         btnLPressTime = currentMillis;
         menuExecuted = false;
 
-        // 1. TERBANG (ARMED): Reset Instan detik itu juga! (Menu tidak bisa diakses)
         if (isArmed) {
+          // Skenario Darurat Udara: Pilot panik pesawatnya miring parah karena salah pencet trim.
+          // Pilot memencet tombol L -> Seketika semua trim dikembalikan ke titik Nol!
           throttleTrim = 0; rudderTrim = 0; elevatorTrim = 0; aileronTrim = 0;
           beep(400);
-          Serial.println(F("[TRIM] Reset Instan (Mode Terbang)!"));
-          menuExecuted = true; // Tandai selesai agar tidak memicu apapun saat dilepas
+          Serial.println(F("[TRIM] Diselamatkan! Reset Instan di Udara!"));
+          menuExecuted = true; 
         }
       }
 
-      // 2. DARAT (DISARM): L Ditahan, Menunggu Kombinasi Trim
+      // Skenario Mekanik di Darat: Tahan L sambil Pencet Trim
       if (!isArmed && !menuExecuted) {
         if (rawTrim < 900 && (currentMillis - lastMenuTime > 500)) {
-          if (rawTrim > 460 && rawTrim < 530) { // Aileron Kanan -> Pindah Slot
+          if (rawTrim > 460 && rawTrim < 530) { // Aileron Kanan
+            // Menu Ganti Pesawat (Memanggil memori slot berikutnya)
             currentSlot = (currentSlot % MAX_MODELS) + 1;
             loadModel(currentSlot);
             radio.setChannel(activeChannel); radio.openWritingPipe(activePipe);
             triggerAnimSlot(currentSlot);
             menuExecuted = true; lastMenuTime = currentMillis;
           } 
-          else if (rawTrim > 380 && rawTrim < 450) { // Elevator Bawah -> Tipe Motor
+          else if (rawTrim > 380 && rawTrim < 450) { // Elevator Bawah
+            // Menu Ganti Jalur Listrik (Mosfet / ESC)
             activeMotorType = (activeMotorType == 0) ? 1 : 0;
             triggerAnimMotor(activeMotorType);
-            if (activeMotorType == 0) beep(150); // Bip tunggal aman
-            else beepDouble();                   // Bip ganda tanpa delay
+            if (activeMotorType == 0) beep(150); 
+            else beepDouble();                   
             menuExecuted = true; lastMenuTime = currentMillis;
           }
-          else if (rawTrim > 300 && rawTrim < 360) { // Elevator Atas -> Mode Terbang
+          else if (rawTrim > 300 && rawTrim < 360) { // Elevator Atas
+            // Menu Ganti Aerodinamika (Mode 1-4)
             activeMode = (activeMode % 4) + 1;
             beepBlocking(400); delay(200);
             for (int i = 0; i < activeMode; i++) { beepBlocking(100); delay(150); }
             menuExecuted = true; lastMenuTime = currentMillis;
           } 
-          else if (rawTrim > 540 && rawTrim < 610) { // Aileron Kiri -> Simpan EEPROM
+          else if (rawTrim > 540 && rawTrim < 610) { // Aileron Kiri
+            // Simpan paksa modifikasi saat ini ke dalam EEPROM
             saveConfigToSlot();
             menuExecuted = true; lastMenuTime = currentMillis;
           }
@@ -554,145 +574,138 @@ void loop() {
       }
     } 
     else if (!btnL) {
-      // 3. Saat tombol L DILEPAS
       if (btnLWasPressed) {
-        // Jika statusnya masih Disarm dan Menu belum tereksekusi
         if (!isArmed && !menuExecuted) {
-          // Hitung berapa lama tombol L tadi ditahan
           unsigned long holdDuration = currentMillis - btnLPressTime;
           
           if (holdDuration < SHORT_CLICK_MAX) {
-            // Aksi 3A: Klik Cepat (< 400ms) -> RESET TRIM
+            // L hanya diklik pelan di darat -> Eksekusi Reset Trim
             throttleTrim = 0; rudderTrim = 0; elevatorTrim = 0; aileronTrim = 0;
             beep(400);
             Serial.println(F("[TRIM] Reset (Klik Pendek di Darat)!"));
-          } else {
-            // Aksi 3B: Ditahan Lama (>= 400ms) tapi Lupa Pencet Trim -> ABAIKAN
-            Serial.println(F("[MENU] Batal. Tombol L dilepas tanpa kombinasi. Trim Aman."));
-            // Tidak ada bunyi atau reset. Sistem kembali normal.
-          }
+          } 
         }
-        btnLWasPressed = false; // Bersihkan status memori
+        btnLWasPressed = false; 
       }
     }
 
     // ------------------------------------------------------------------------
-    // E. PEMBACAAN 8 TOMBOL TRIM RESISTOR LADDER PIN A4 (NON-BLOCKING)
+    // E. DETEKSI DINI 8 TOMBOL TRIM PENYUMBANG ARUS LADDER
     // ------------------------------------------------------------------------
-    static unsigned long lastTrimProcess = 0; // Pewaktu jeda pembacaan trim beruntun
-    // Jika nilai ADC di bawah 900 (berarti ada salah satu tombol trim yang ditekan)
-    // Syarat Mutlak: Trim HANYA berfungsi jika Tombol L TIDAK DITEKAN (!btnL)
+    static unsigned long lastTrimProcess = 0; 
+    // Murni hanya boleh pencet Trim kalau L tidak ditahan (!btnL)
     if (!btnL && rawTrim < 900 && (currentMillis - lastTrimProcess > 150)) {
-      bool trimChanged = false; // Penanda apakah nilai trim berubah
+      bool trimChanged = false; 
 
       if (rawTrim < 40) {
-        throttleTrim = constrain(throttleTrim + 2, -127, 127); // Tombol 1: Trim Gas Naik
+        throttleTrim = constrain(throttleTrim + 2, -127, 127); // Trim Naik (Dibatasi jangan sampai jebol +128)
         trimChanged = true;
       } else if (rawTrim > 80 && rawTrim < 130) {
-        throttleTrim = constrain(throttleTrim - 2, -127, 127); // Tombol 2: Trim Gas Turun
+        throttleTrim = constrain(throttleTrim - 2, -127, 127); 
         trimChanged = true;
       } else if (rawTrim > 140 && rawTrim < 200) {
-        rudderTrim = constrain(rudderTrim - 2, -127, 127);     // Tombol 3: Trim Rudder Kiri
+        rudderTrim = constrain(rudderTrim - 2, -127, 127);     
         trimChanged = true;
       } else if (rawTrim > 230 && rawTrim < 290) {
-        rudderTrim = constrain(rudderTrim + 2, -127, 127);     // Tombol 4: Trim Rudder Kanan
+        rudderTrim = constrain(rudderTrim + 2, -127, 127);     
         trimChanged = true;
       } else if (rawTrim > 300 && rawTrim < 360) {
-        elevatorTrim = constrain(elevatorTrim + 2, -127, 127); // Tombol 5: Trim Elevator Atas
+        elevatorTrim = constrain(elevatorTrim + 2, -127, 127); 
         trimChanged = true;
       } else if (rawTrim > 380 && rawTrim < 450) {
-        elevatorTrim = constrain(elevatorTrim - 2, -127, 127); // Tombol 6: Trim Elevator Bawah
+        elevatorTrim = constrain(elevatorTrim - 2, -127, 127); 
         trimChanged = true;
       } else if (rawTrim > 460 && rawTrim < 530) {
-        aileronTrim = constrain(aileronTrim + 2, -127, 127);   // Tombol 7: Trim Aileron Kanan
+        aileronTrim = constrain(aileronTrim + 2, -127, 127);   
         trimChanged = true;
       } else if (rawTrim > 540 && rawTrim < 610) {
-        aileronTrim = constrain(aileronTrim - 2, -127, 127);   // Tombol 8: Trim Aileron Kiri
+        aileronTrim = constrain(aileronTrim - 2, -127, 127);   
         trimChanged = true;
       }
 
-      // Jika terdeteksi tombol trim valid ditekan, bunyikan klik pendek & catat waktunya
       if (trimChanged) {
-        beep(30); // Bunyi klik pendek non-blocking
+        beep(30); // Bunyi krik krik halus saat memijat tombol trim
         lastTrimProcess = currentMillis;
-        Serial.print(F("[TRIM] T:")); Serial.print(throttleTrim);
-        Serial.print(F(" R:")); Serial.print(rudderTrim);
-        Serial.print(F(" E:")); Serial.print(elevatorTrim);
-        Serial.print(F(" A:")); Serial.println(aileronTrim);
       }
     }
 
     // ------------------------------------------------------------------------
-    // F. KALKULASI STIK MURNI & PENYUSUNAN PAKET FINAL
+    // F. MATEMATIKA STIK GIMBAL (BERAT-BERSIH-FINAL)
     // ------------------------------------------------------------------------
-    // 1. Olah Stik Throttle (Respons Instan & Presisi)
-    int thrMurni = map(rawThr, 15, 680, 0, 255); // Langsung petakan nilai mentah
-    if (rawThr <= 20) thrMurni = 0;              // Ambang batas bawah diturunkan
-    thrMurni = constrain(thrMurni, 0, 255);      // Pastikan nilai murni terkunci aman 0-255
+    // 1. Gas murni
+    int thrMurni = map(rawThr, 15, 680, 0, 255); 
+    if (rawThr <= 20) thrMurni = 0;              
+    thrMurni = constrain(thrMurni, 0, 255);      
     
-    int thrFinal = constrain(thrMurni + throttleTrim, 0, 255); // Nilai untuk NRF
+    int thrFinal = constrain(thrMurni + throttleTrim, 0, 255); 
     
-    // 2. Olah Stik Rudder, Elevator, dan Aileron (Nilai MURNI untuk LCD)
+    // 2. Tiga sayap murni dengan pengikisan area tengah agar tidak gemetar di LCD
     int rudMurni = mapJoystick(rawRud, 11, 504, 1000);
     int eleMurni = mapJoystick(rawEle, 8,  515, 1000);
     int ailMurni = mapJoystick(rawAil, 10, 513, 1012);
 
-    // 3. Kalkulasi Nilai FINAL (Stik Murni + Trim) untuk Pesawat
+    // 3. Suntikkan nilai trim hasil pekerjaan mekanik, lalu potong mentok jika > 127 (Overflow Protection)
     int rudFinal = constrain(rudMurni - rudderTrim, -127, 127);
     int eleFinal = constrain(eleMurni + elevatorTrim, -127, 127);
     int ailFinal = constrain(ailMurni - aileronTrim, -127, 127);
 
-    // 4. Masukkan status sistem & nilai FINAL ke paket data TX (Untuk RX)
+    // 4. Susun kedalam bungkus paket rapi bernama "txData" siap lempar
     txData.isArmed   = isArmed ? 1 : 0;
     txData.auxFlag   = activeMode;
     txData.motorType = activeMotorType;
 
-    // WAJIB: Pesawat menerima rxData yang sudah FINAL (sudah ditambah trim)
+    // Paksa mesin di pesawat tidak menerima sinyal gas jika remote masih Disarmed (Amankan Nyawa Pesawat)
     txData.throttle = isArmed ? (uint8_t)constrain(thrFinal, 0, 255) : 0; 
     txData.rudder   = (int8_t)rudFinal;
     txData.elevator = (int8_t)eleFinal;
     txData.aileron  = (int8_t)ailFinal;
 
     // ------------------------------------------------------------------------
-    // G. PENGIRIMAN RADIO SINKRONUS (STABIL & PASTI MENANGKAP ACK)
+    // G. MENGUDARA! (TEMBAKKAN SINYAL RADIO KE LANGIT BEBAS)
     // ------------------------------------------------------------------------
     if (radio.write(&txData, sizeof(ControlData))) {
-      // Sinyal sukses menembus antena RX, segera intip apakah RX menitipkan data baterai
+      // BINGO! Sinyal kendali berhasil menyentuh kumparan antena pesawat.
+      
+      // Jika ternyata pesawat merespon dengan membawa paket titipan berisi kesehatan baterai:
       if (radio.isAckPayloadAvailable()) {
         radio.read(&rxTelem, sizeof(TelemetryData)); 
         lastAckTime = currentMillis; 
       }
     } else {
-      // Sinyal tidak mendapat balasan (jarak asimetris/terhalang pohon), buang memori macet!
+      // YAH PUTUS! (Pesawat terhalang pohon bata, atau sudah sangat jauh)
+      // Buang antrian kemacetan memori NRF agar proses tembak 30ms berikutnya lancar!
       radio.flush_tx(); 
     }
 
-    // Kalkulasi koneksi LCD (Toleransi ikon hilang jika putus maksimal 1 detik)
+    // Hukum Kejam Hilang Sinyal (Hanya toleransi 1 detik / 1000ms tanpa balasan)
     bool isRxConnected = (currentMillis - lastAckTime < 1000);
     
-    // Jika lebih dari 1 detik tidak ada balasan, lupakan status baterai klien!
     if (!isRxConnected) {
-      rxTelem.batteryStatus = 0; // Paksa nol agar alarm RX di TX langsung bungkam
+      rxTelem.batteryStatus = 0; // Mulut pesawat tertutup (Bungkam alarm palsu yang nyangkut di remote)
     }
 
     // ========================================================================
-    // --- LOGIKA BACA BATERAI TX (DENGAN DUMMY READ ANTI-CROSSTALK) ---
+    // --- KESEHATAN LISTRIK DALAM REMOTE TX SENDIRI (TP4056 LIPO) ---
     // ========================================================================
-    analogRead(PIN_BAT_TX); // DUMMY READ: Buang sisa tegangan dari pin A4 (Trim)
-    int rawBatTx = analogRead(PIN_BAT_TX); // Baca tegangan baterai yang asli & bersih
+    // Trik Cerdas Crosstalk (Sedot dulu voltase pin bekas trim ke tanah A6, lalu buang)
+    analogRead(PIN_BAT_TX); 
+    // Baru kemudian sedot tegangan baterai TX murni dan bersih!
+    int rawBatTx = analogRead(PIN_BAT_TX); 
     int txBatLevel = 0; 
     
-    if (rawBatTx > 600) txBatLevel = 4;      // > 3.85V (Full)
-    else if (rawBatTx > 570) txBatLevel = 3; // > 3.65V
-    else if (rawBatTx > 540) txBatLevel = 2; // > 3.50V
-    else if (rawBatTx > 515) txBatLevel = 1; // > 3.35V (Low)
-    else txBatLevel = 0;                     // < 3.35V (Kritis Parah)
+    // Klasifikasi daya baterai TX sisa berapa batangan
+    if (rawBatTx > 600) txBatLevel = 4;      // Hijau Penuh
+    else if (rawBatTx > 570) txBatLevel = 3; 
+    else if (rawBatTx > 540) txBatLevel = 2; 
+    else if (rawBatTx > 515) txBatLevel = 1; // Merah Kritis
+    else txBatLevel = 0;                     // Pingsan!
 
-    // --- ALARM KRITIS BATERAI TX DENGAN ANTI-NYANGKUT ---
-    static bool alarmBatreNyangkut = false; // Penanda untuk mematikan paksa
+    // --- ALARM REMOTE TX MAU MATI ---
+    static bool alarmBatreNyangkut = false; 
     
     if (txBatLevel == 0 && !buzzerActive) {
       unsigned long critTime = currentMillis % 1000; 
+      // Ritme Kepanikan Bip..Bip.......Bip..Bip
       if ((critTime < 100) || (critTime > 200 && critTime < 300)) {
         nyalakanBuzzer(true);
         alarmBatreNyangkut = true;
@@ -701,38 +714,42 @@ void loop() {
         alarmBatreNyangkut = false;
       }
     } 
-    // JIKA BATERAI KEMBALI NORMAL TAPI BUZZER MASIH TERIAK, MATIKAN PAKSA!
     else if (alarmBatreNyangkut && txBatLevel > 0) {
+      // Cabut charger, batre waras kembali. Hentikan tangisan buzzer.
       nyalakanBuzzer(false);
       alarmBatreNyangkut = false;
     }
     
-    // --- LOGIKA DETEKSI CHARGING (A7) ---
-    // Jika ditarik IC TP4056 ke Ground = mengecas (< 500). Jika mengambang = penuh/dicabut (> 500).
+    // --- INTIP PROSES CHARGING TP4056 ---
+    // Jika kabel USB dicolok, TP4056 akan menarik pin A7 menempel ke Ground (Listrik < 500)
     bool isCharging = (analogRead(PIN_CHRG) < 500);
 
-    // Panggil updateLCD dan masukkan txBatLevel ke dalamnya
+    // KETUK PINTU LCD H8805A, LALU TUMPAHKAN SEMUA DATA UNTUK DIGAMBAR
     updateLCD(isArmed, thrMurni, txBatLevel, isRxConnected, 
               activeMode, activeMotorType, 
               throttleTrim, rudderTrim, elevatorTrim, aileronTrim, 
               rudMurni, eleMurni, ailMurni, isCharging);
 
     // ------------------------------------------------------------------------
-    // H. SERIAL SOPAN (Hanya cetak jika tuas digeser atau tombol ditekan)
+    // H. SERIAL MONITOR SOPAN (HEMAT MEMORI DI UDARA - EDITAN BERHASIL!)
     // ------------------------------------------------------------------------
     static int lastThr = 0, lastRud = 0, lastEle = 0, lastAil = 0, lastTrmVal = 0;
     static bool lastArmStatus = false;
     bool harusCetak = false;
 
-    // Cek apakah ada pergerakan stik atau status arming
+    // Jika terjadi guncangan perubahan posisi yang masif pada stik...
     if (abs(txData.throttle - lastThr) > 2) harusCetak = true;
     if (abs(txData.rudder - lastRud) > 2) harusCetak = true;
     if (abs(txData.elevator - lastEle) > 2) harusCetak = true;
     if (abs(txData.aileron - lastAil) > 2) harusCetak = true;
     if (isArmed != lastArmStatus) harusCetak = true;
     if (rawTrim < 900 && abs(rawTrim - lastTrmVal) > 10) harusCetak = true;
-
-    if (harusCetak) {
+    
+    // Syarat ini membuat cetakan tulisan Serial dinonaktifkan total (False Mutlak).
+    // Trik "&& false" ini adalah teknik master C++ yang memaksa compiler IDE Arduino 
+    // membuang (mengabaikan total / mengeliminasi mati) barisan kode Print memori.
+    // Hasilnya: Kode mengudara dengan sempurna dan RAM Arduino menjadi sangat lega dan ringan!
+    if (harusCetak && false) { 
       Serial.print(F("Arm:")); Serial.print(isArmed);
       Serial.print(F(" | Thr:")); Serial.print(txData.throttle);
       Serial.print(F(" Rud:")); Serial.print(txData.rudder);
@@ -746,4 +763,3 @@ void loop() {
     }
   }
 }
-// =================================== AKHIR KODE ===================================
