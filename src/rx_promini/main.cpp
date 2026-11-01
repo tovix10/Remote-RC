@@ -191,13 +191,15 @@ void setup() {
 
   // --- KECERDASAN AUTO-CELL DETECT (Deteksi Voltase Otomatis Awal) ---
   // Membaca voltase pertama kali colok baterai. 
-  // Angka 14300 didapat dari (1.1 Volt x Rasio Resistor 120k/10k)
+  // Angka 14800 didapat dari (1.1 Volt x Rasio Resistor 120k/10k)
+  analogRead(PIN_VBATT); // Baca sekali untuk menstabilkan ADC
+  delay(10); // Jeda sebentar agar ADC stabil
   uint16_t initialMilliVolt = map(analogRead(PIN_VBATT), 0, 1023, 0, 14300);
   
   // Logika Pemisahan Sel (Threshold)
-  if (initialMilliVolt < 4350) {
+  if (initialMilliVolt < 4600) {
     detectedCells = 1; // Jika voltase < 4.35V, pasti baterai 1S
-    lowBatteryThreshold = 3300; // Alarm bunyi saat 1S menyentuh 3.3V
+    lowBatteryThreshold = 3500; // Alarm bunyi saat 1S menyentuh 3.5V
   } else if (initialMilliVolt < 8500) {
     detectedCells = 2; // Jika voltase < 8.5V, pasti baterai 2S
     lowBatteryThreshold = 7000; // Alarm bunyi saat 2S menyentuh 7.0V (3.5V/sel)
