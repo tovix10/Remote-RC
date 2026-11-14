@@ -666,10 +666,12 @@ void loop() {
     if (radio.write(&txData, sizeof(ControlData))) {
       // BINGO! Sinyal kendali berhasil menyentuh kumparan antena pesawat.
       
-      // Jika ternyata pesawat merespon dengan membawa paket titipan berisi kesehatan baterai:
+      // 1. Prioritas Utama: Jika sampai di baris ini, artinya pesawat PASTI nyambung!
+      lastAckTime = currentMillis; 
+      
+      // 2. Prioritas Kedua: Cek apakah ada bonus titipan paket Telemetri baterai
       if (radio.isAckPayloadAvailable()) {
         radio.read(&rxTelem, sizeof(TelemetryData)); 
-        lastAckTime = currentMillis; 
       }
     } else {
       // YAH PUTUS! (Pesawat terhalang pohon bata, atau sudah sangat jauh)

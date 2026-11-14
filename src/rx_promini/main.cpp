@@ -37,6 +37,7 @@
 #include <RF24.h>      // Library khusus otak pengendali modul radio NRF24L01
 #include <Servo.h>     // Library pembuat sinyal PWM presisi (1000us-2000us) untuk ESC dan Servo Sayap
 #include <EEPROM.h>    // Library untuk menulis/membaca data ke memori permanen Arduino
+#include <avr/wdt.h>   // Panggil Anjing Penjaga (Watchdog)
 
 // ============================================================================
 // 1. KONFIGURASI PIN HARDWARE (PRO MINI)
@@ -230,25 +231,44 @@ void setup() {
   servo3.attach(PIN_SERVO_3);
   servo4.attach(PIN_SERVO_4);
   
-  Serial.println(F("[SYSTEM] RX Siap Terbang."));
+  wdt_enable(WDTO_250MS); 
+  
+  Serial.println(F("[SYSTEM] RX Siap Terbang (Watchdog Aktif)."));
 }
 
 // ============================================================================
 // 6. FUNGSI UTAMA: LOOP (OTAK REAL-TIME PENERBANGAN)
 // ============================================================================
 void loop() {
+  wdt_reset(); // Beri makan anjing setiap putaran agar tidak me-reset Arduino!
   unsigned long currentMillis = millis(); // Baca stopwatch utama Arduino
 
   // --- A. PENERIMAAN DATA DARI TX ---
   if (radio.available()) {
-    radio.read(&rxData, sizeof(ControlData)); // Timpa data lama dengan data baru dari radio
-    lastRecvTime = currentMillis;             // Reset stopwatch "Detak Jantung" (Watchdog)
+    radio.read(&rxData, sizeof(ControlData)); 
+    lastRecvTime = currentMillis;             
     
+    // --- TAMBAHAN ANTI-GHOST PACKET (NRF LOCKUP DETECTOR) ---
+    static int packetCount = 0;
+    static unsigned long lastCountTime = 0;
+    packetCount++; // Hitung setiap paket yang masuk
+    
+    // Evaluasi setiap 1 detik
+    if (currentMillis - lastCountTime >= 1000) {
+      if (packetCount > 100) {
+        // MUSTAHIL! TX hanya kirim 33 paket per detik. NRF pasti MACET!
+        Serial.println(F("[FATAL] NRF HANG TERDETEKSI! Memaksa Watchdog Reset..."));
+        while(1); // Terjebak di sini agar Watchdog menggigit dan mereset sistem secara fisik!
+      }
+      packetCount = 0; // Reset hitungan untuk detik berikutnya
+      lastCountTime = currentMillis;
+    }
+    // ---------------------------------------------------------
+
     // PEMULIHAN DARI FAILSAFE 
-    // Jika sinyal tadinya hilang lalu kembali masuk...
     if (failsafeActive) { 
-      failsafeActive = false; // Matikan status bahaya
-      rxData.isArmed = 0;     // KUNCI PENGAMAN INSTAN: Paksa motor mati meskipun stik gas remote sedang tinggi
+      failsafeActive = false; 
+      rxData.isArmed = 0;     
       Serial.println(F("[RADIO] Link Tersambung Kembali. Motor Terkunci Otomatis."));
     }
     
@@ -270,8 +290,8 @@ void loop() {
   }
 
   // --- B. LOGIKA FAILSAFE (PENGAMAN KEHILANGAN SINYAL) ---
-  // Jika selisih waktu sekarang dengan detak jantung terakhir melebihi 1000 milidetik (1 Detik)
-  if (currentMillis - lastRecvTime > 1000) {
+  // Jika selisih waktu sekarang dengan detak jantung terakhir melebihi 500 milidetik (0.5 Detik)
+  if (currentMillis - lastRecvTime > 500) {
     if (!failsafeActive) {
       Serial.println(F("[FAILSAFE] Sinyal Hilang! Memicu No-Pulses Failsafe."));
       failsafeActive = true;
@@ -310,16 +330,22 @@ void loop() {
   // --- C. EKSEKUSI PENGGERAK (HANYA BERJALAN JIKA SINYAL AMAN) ---
   if (!failsafeActive) {
     
-    // 1. THROTTLE SLEW-RATE LIMITER (Peredam Lonjakan Arus Baterai 1S)
-    // Tujuannya mencekik akselerasi agar Arduino tidak mati akibat tarikan arus dadakan motor N30.
+    // 1. THROTTLE SLEW-RATE LIMITER (Peredam Lonjakan Berbasis Waktu Mutlak)
     int targetThrottle = rxData.isArmed ? rxData.throttle : 0;
     
-    // Jika stik gas di remote mendadak dinaikkan full (contoh: dari 0 langsung ke 255)
     if (targetThrottle > currentThrottle) {
-       currentThrottle += 15; // Jangan langsung 255, tapi naikin pelan-pelan kelipatan 15 per siklus loop
-       if (currentThrottle > targetThrottle) currentThrottle = targetThrottle; // Cegah kebablasan
+      // Hanya naikkan putaran mesin jika interval waktu sudah terpenuhi
+      static unsigned long lastSlewTime = 0;
+      const unsigned int SLEW_INTERVAL = 5; // Jeda waktu (5 milidetik)
+      const int SLEW_STEP = 2;              // Ukuran pijakan gas (naik 2 angka)
+      
+      if (currentMillis - lastSlewTime >= SLEW_INTERVAL) {
+         currentThrottle += SLEW_STEP; 
+         if (currentThrottle > targetThrottle) currentThrottle = targetThrottle; // Cegah kebablasan
+         lastSlewTime = currentMillis; // Reset stopwatch akselerasi
+      }
     } else {
-       // KESELAMATAN: Jika gas diturunkan, WAJIB instan! Jangan di-delay turunnya.
+       // KESELAMATAN MUTLAK: Jika gas diturunkan, WAJIB instan seketika itu juga!
        currentThrottle = targetThrottle; 
     }
 
@@ -419,7 +445,20 @@ void loop() {
     servo3.write(constrain(outS3, 45, 135));
     servo4.write(constrain(outS4, 45, 135));
     
-    // Visual nyata di lapangan: LED Menyala = Mesin Berbahaya. LED Mati = Mesin Aman Disentuh.
-    digitalWrite(PIN_LED, rxData.isArmed ? HIGH : LOW);
+  } 
+  // --- TAMBAHAN 3B: SMART LED HEARTBEAT (DI LUAR BLOK FAILSAFE) ---
+  int cycle = currentMillis % 1000; // Membuat putaran waktu 1 detik (0 - 999 ms)
+  
+  if (failsafeActive) {
+    // 1. FAILSAFE: Kedip santai (Setengah detik nyala, setengah detik mati)
+    digitalWrite(PIN_LED, (cycle < 500) ? HIGH : LOW);
+  } else {
+    if (rxData.isArmed) {
+      // 2. ARMED (Mesin Bahaya): LED Nyala Terang, tapi berkedut MATI sekejap setiap 1 detik
+      digitalWrite(PIN_LED, (cycle < 50) ? LOW : HIGH); 
+    } else {
+      // 3. DISARMED (Mesin Aman): LED Mati Gelap, tapi berkedut NYALA sekejap setiap 1 detik
+      digitalWrite(PIN_LED, (cycle < 50) ? HIGH : LOW);
+    }
   }
-}
+} 
